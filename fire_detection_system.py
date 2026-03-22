@@ -11,11 +11,13 @@ try:
     from twilio.rest import Client
     TWILIO_ENABLED = True
 except ImportError:
-    TWILIO_ENABLED = False
+    print("Please Create Keys.py file with your Twilio Credentials")
+    exit()
+   
 
 # Model Paths
-OBJ_MODEL_PATH = "yolov8n.pt"
-FIRE_MODEL_PATH = "fire_model.pt"
+OBJ_MODEL_PATH = "yolov8n.pt"# place Path of your Object detection model. Use .pt file for the path 
+FIRE_MODEL_PATH = "fire_model.pt" # place Path of your Fire/Smoke detection model. Use .pt file for the path 
 
 if not os.path.exists(FIRE_MODEL_PATH):
     raise FileNotFoundError(f"Missing: {FIRE_MODEL_PATH}")
