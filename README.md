@@ -56,8 +56,7 @@ Bash
 python fire_detection_system.py
 ⚠️ Important Notes
 Model files are not included due to GitHub size limitations
-Do NOT upload your credentials file (keys.py) to GitHub
-Use keys_example.py as a reference
+
 📊 System Workflow
 Capture video frames
 Detect objects and humans using YOLO
