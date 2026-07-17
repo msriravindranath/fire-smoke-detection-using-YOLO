@@ -2,365 +2,1497 @@ import cv2
 import os
 import time
 import threading
+from collections import deque
+
 import numpy as np
 from ultralytics import YOLO
 
-# Optional Twilio Alert System
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+# Model paths
+OBJ_MODEL_PATH = "yolov8n.pt"
+FIRE_MODEL_PATH = "fire_model.pt"
+
+# Camera
+CAMERA_INDEX = 0
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 480
+
+# Detection
+FIRE_CONFIDENCE = 0.65
+REQUIRED_STREAK = 3
+
+# Fire HSV validation
+HSV_FIRE_RATIO_THRESHOLD = 0.02
+
+# Hazard size thresholds
+# These are normalized relative to the total frame area.
+SMALL_HAZARD_RATIO = 0.02
+LARGE_HAZARD_RATIO = 0.10
+
+# Person proximity
+# Distance is normalized by the frame diagonal.
+PERSON_NEAR_DISTANCE_RATIO = 0.25
+
+# Fire growth tracking
+GROWTH_HISTORY_SIZE = 8
+RAPID_GROWTH_THRESHOLD = 0.04
+
+# Alert cooldown
+SMS_COOLDOWN = 60
+
+# Performance
+FPS_TARGET = 15.0
+INFERENCE_INTERVAL = 1.0 / FPS_TARGET
+
+
+# ============================================================
+# OPTIONAL TWILIO CONFIGURATION
+# ============================================================
+
 try:
     import keys
     from twilio.rest import Client
-    TWILIO_ENABLED = True
-except ImportError:
-    print("Please Create Keys.py file with your Twilio Credentials")
-    exit()
-   
 
-# Model Paths
-OBJ_MODEL_PATH = "yolov8n.pt"# place Path of your Object detection model. Use .pt file for the path 
-FIRE_MODEL_PATH = "fire_model.pt" # place Path of your Fire/Smoke detection model. Use .pt file for the path 
+    TWILIO_ENABLED = True
+    print("Twilio configuration loaded.")
+
+except ImportError:
+    TWILIO_ENABLED = False
+    Client = None
+
+    print(
+        "WARNING: Twilio is not configured. "
+        "Detection will continue without SMS alerts."
+    )
+
+
+# ============================================================
+# LOAD MODELS
+# ============================================================
 
 if not os.path.exists(FIRE_MODEL_PATH):
-    raise FileNotFoundError(f"Missing: {FIRE_MODEL_PATH}")
+    raise FileNotFoundError(
+        f"Fire detection model not found: {FIRE_MODEL_PATH}"
+    )
 
 try:
     model_obj = YOLO(OBJ_MODEL_PATH)
     model_fire = YOLO(FIRE_MODEL_PATH)
-except Exception as e:
-    raise RuntimeError(f"Failed to load models: {e}")
 
-# Detection Thresholds
-SMALL_THRESH = 3000
-LARGE_THRESH = 15000
-REQUIRED_STREAK = 3
+except Exception as e:
+    raise RuntimeError(
+        f"Failed to load YOLO models: {e}"
+    )
+
+
+# ============================================================
+# GLOBAL SYSTEM STATE
+# ============================================================
 
 current_streak = 0
-sms_cooldown = 60
+
 last_sms_time = 0
 last_alert_level = 0
 
-# Performance Settings
-FPS_TARGET = 15.0
-INFERENCE_INTERVAL = 1.0 / FPS_TARGET
-
-# Alert System
-def trigger_alert(message, level):
-    global last_sms_time, last_alert_level
-
-    now = time.time()
-    is_escalation = (level == 3 and last_alert_level < 3)
-
-    if (now - last_sms_time > sms_cooldown) or is_escalation:
-        last_sms_time = now
-        last_alert_level = level
-
-        print(f"\n🚨 ALERT: {message}")
-
-        if TWILIO_ENABLED:
-            threading.Thread(target=_send_sms, args=(message,), daemon=True).start()
-        else:
-            print("⚠️ Twilio disabled. SMS simulated.\n")
+fire_area_history = deque(
+    maxlen=GROWTH_HISTORY_SIZE
+)
 
 
-def _send_sms(msg):
-    try:
-        client = Client(keys.accountSID, keys.authToken)
+# ============================================================
+# ALERT SYSTEM
+# ============================================================
 
-        client.messages.create(
-            body=f"YOLO Early FIRE/SMOKE detection and Alert System: {msg}",
-            from_=keys.twilioNumber,
-            to=keys.targetNumber
+def get_recipient(level):
+    """
+    Return the configured recipient for the alert level.
+
+    Level 2:
+        Property owner.
+
+    Level 3:
+        Emergency TEST contact.
+
+    Real emergency-service numbers should NOT be used during
+    prototype testing.
+    """
+
+    if level == 2:
+        return getattr(
+            keys,
+            "ownerNumber",
+            getattr(keys, "targetNumber", None)
         )
 
-        print("✅ SMS SENT\n")
+    if level == 3:
+        return getattr(
+            keys,
+            "emergencyTestNumber",
+            getattr(keys, "targetNumber", None)
+        )
+
+    return None
+
+
+def trigger_local_alarm(message):
+    """
+    Prototype local alarm.
+
+    Replace this function with actual CCTV speaker,
+    buzzer, GPIO, or IoT alarm integration during
+    hardware deployment.
+    """
+
+    print(f"\nLOCAL ALARM: {message}")
+
+
+def trigger_alert(message, level):
+    """
+    Execute the appropriate response according to
+    the hazard level.
+
+    Level 1:
+        Local alarm only.
+
+    Level 2:
+        Local alarm + owner SMS.
+
+    Level 3:
+        Local alarm + owner SMS +
+        emergency TEST contact SMS.
+    """
+
+    global last_sms_time
+    global last_alert_level
+
+    # Local alarm is triggered at every verified level.
+    trigger_local_alarm(message)
+
+    # Level 1 requires only local response.
+    if level == 1:
+        last_alert_level = max(last_alert_level, level)
+        return
+
+    if not TWILIO_ENABLED:
+        print(
+            f"SMS disabled. Simulated Level {level} alert."
+        )
+
+        last_alert_level = max(
+            last_alert_level,
+            level
+        )
+
+        return
+
+    now = time.time()
+
+    is_escalation = level > last_alert_level
+
+    cooldown_expired = (
+        now - last_sms_time >= SMS_COOLDOWN
+    )
+
+    if not (
+        cooldown_expired or is_escalation
+    ):
+        return
+
+    last_sms_time = now
+    last_alert_level = level
+
+    recipients = []
+
+    # Owner should receive both Level 2 and Level 3.
+    owner = getattr(
+        keys,
+        "ownerNumber",
+        getattr(keys, "targetNumber", None)
+    )
+
+    if owner:
+        recipients.append(owner)
+
+    # Level 3 additionally alerts the emergency test contact.
+    if level == 3:
+
+        emergency_test = getattr(
+            keys,
+            "emergencyTestNumber",
+            None
+        )
+
+        if (
+            emergency_test
+            and emergency_test not in recipients
+        ):
+            recipients.append(
+                emergency_test
+            )
+
+    for recipient in recipients:
+
+        threading.Thread(
+            target=send_sms,
+            args=(
+                message,
+                recipient,
+                level
+            ),
+            daemon=True
+        ).start()
+
+
+def send_sms(
+    message,
+    recipient,
+    level
+):
+
+    try:
+
+        client = Client(
+            keys.accountSID,
+            keys.authToken
+        )
+
+        client.messages.create(
+
+            body=(
+                "YOLO Fire/Smoke Detection System\n"
+                f"Alert Level: {level}\n"
+                f"{message}"
+            ),
+
+            from_=keys.twilioNumber,
+
+            to=recipient
+        )
+
+        print(
+            f"SMS sent successfully "
+            f"for Level {level}."
+        )
 
     except Exception as e:
-        print(f"❌ SMS FAILED: {e}\n")
 
-# HSV Fire Validation
-def is_physically_fire(frame, box):
+        print(
+            f"SMS failed: {e}"
+        )
 
-    x1, y1, x2, y2 = map(int, box)
 
-    roi = frame[max(0, y1):y2, max(0, x1):x2]
+# ============================================================
+# FIRE VALIDATION
+# ============================================================
+
+def is_physically_fire(
+    frame,
+    box
+):
+
+    x1, y1, x2, y2 = map(
+        int,
+        box
+    )
+
+    height, width = frame.shape[:2]
+
+    x1 = max(
+        0,
+        min(x1, width)
+    )
+
+    x2 = max(
+        0,
+        min(x2, width)
+    )
+
+    y1 = max(
+        0,
+        min(y1, height)
+    )
+
+    y2 = max(
+        0,
+        min(y2, height)
+    )
+
+    if (
+        x2 <= x1
+        or y2 <= y1
+    ):
+        return False
+
+    roi = frame[
+        y1:y2,
+        x1:x2
+    ]
 
     if roi.size == 0:
         return False
 
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-
-    lower_fire = np.array([0, 100, 200])
-    upper_fire = np.array([35, 255, 255])
-
-    mask = cv2.inRange(hsv, lower_fire, upper_fire)
-
-    ratio = cv2.countNonZero(mask) / float(roi.shape[0] * roi.shape[1] + 1)
-
-    return ratio > 0.02
-
-# Bounding Box Intersection
-def intersects(a, b):
-
-    ax1, ay1, ax2, ay2 = a
-    bx1, by1, bx2, by2 = b
-
-    return not (
-        ax2 < bx1 or
-        ax1 > bx2 or
-        ay2 < by1 or
-        ay1 > by2
+    hsv = cv2.cvtColor(
+        roi,
+        cv2.COLOR_BGR2HSV
     )
 
-# Main System
+    lower_fire = np.array(
+        [0, 100, 200]
+    )
+
+    upper_fire = np.array(
+        [35, 255, 255]
+    )
+
+    mask = cv2.inRange(
+        hsv,
+        lower_fire,
+        upper_fire
+    )
+
+    total_pixels = (
+        roi.shape[0]
+        * roi.shape[1]
+    )
+
+    if total_pixels == 0:
+        return False
+
+    fire_pixels = cv2.countNonZero(
+        mask
+    )
+
+    fire_ratio = (
+        fire_pixels
+        / total_pixels
+    )
+
+    return (
+        fire_ratio
+        > HSV_FIRE_RATIO_THRESHOLD
+    )
+
+
+# ============================================================
+# GEOMETRY UTILITIES
+# ============================================================
+
+def box_center(box):
+
+    x1, y1, x2, y2 = box
+
+    center_x = (
+        x1 + x2
+    ) / 2
+
+    center_y = (
+        y1 + y2
+    ) / 2
+
+    return (
+        center_x,
+        center_y
+    )
+
+
+def person_is_near_hazard(
+    person_box,
+    hazard_box,
+    frame_width,
+    frame_height
+):
+
+    person_x, person_y = box_center(
+        person_box
+    )
+
+    hazard_x, hazard_y = box_center(
+        hazard_box
+    )
+
+    distance = np.sqrt(
+
+        (person_x - hazard_x) ** 2
+
+        +
+
+        (person_y - hazard_y) ** 2
+
+    )
+
+    frame_diagonal = np.sqrt(
+
+        frame_width ** 2
+
+        +
+
+        frame_height ** 2
+
+    )
+
+    normalized_distance = (
+        distance
+        / frame_diagonal
+    )
+
+    return (
+        normalized_distance
+        <= PERSON_NEAR_DISTANCE_RATIO
+    )
+
+
+# ============================================================
+# FIRE GROWTH ANALYSIS
+# ============================================================
+
+def calculate_growth_rate():
+
+    if len(
+        fire_area_history
+    ) < 2:
+
+        return 0.0
+
+    oldest_area = (
+        fire_area_history[0]
+    )
+
+    newest_area = (
+        fire_area_history[-1]
+    )
+
+    return (
+        newest_area
+        - oldest_area
+    )
+
+
+# ============================================================
+# MAIN SYSTEM
+# ============================================================
+
 def main():
 
-    global current_streak, last_alert_level
+    global current_streak
+    global last_alert_level
 
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(
+        CAMERA_INDEX
+    )
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    if not cap.isOpened():
+
+        raise RuntimeError(
+            "Unable to open camera."
+        )
+
+    cap.set(
+        cv2.CAP_PROP_FRAME_WIDTH,
+        FRAME_WIDTH
+    )
+
+    cap.set(
+        cv2.CAP_PROP_FRAME_HEIGHT,
+        FRAME_HEIGHT
+    )
 
     prev_frame_time = 0
-    last_inf = 0
+    last_inference_time = 0
 
-    c_boxes = []
-    c_p_boxes = []
-    c_f_boxes = []
-    c_s_boxes = []
-    c_i_boxes = []
+    object_boxes = []
+    person_boxes = []
 
-    alert_text = "SYSTEM SAFE"
-    alert_color = (0, 255, 0)
+    fire_boxes = []
+    smoke_boxes = []
+    ignored_boxes = []
 
     detected_labels = []
 
-    print("🔥 Fire Detection System Started")
-    print("Press Q to quit\n")
+    alert_text = "SYSTEM SAFE"
+
+    alert_color = (
+        0,
+        255,
+        0
+    )
+
+    print(
+        "\nFire Detection System Started"
+    )
+
+    print(
+        "Press Q to quit.\n"
+    )
 
     while True:
 
         ret, frame = cap.read()
 
         if not ret:
+
+            print(
+                "Failed to read camera frame."
+            )
+
             break
 
-        new_frame_time = time.time()
+        current_time = time.time()
 
-        fps = 1 / (new_frame_time - prev_frame_time) if prev_frame_time > 0 else 0
+        if prev_frame_time > 0:
 
-        prev_frame_time = new_frame_time
+            fps = (
 
-        # Controlled Inference
-        if new_frame_time - last_inf >= INFERENCE_INTERVAL:
+                1
 
-            last_inf = new_frame_time
+                /
 
-            c_boxes.clear()
-            c_p_boxes.clear()
-            c_f_boxes.clear()
-            c_s_boxes.clear()
-            c_i_boxes.clear()
+                (
+                    current_time
+                    - prev_frame_time
+                )
+
+            )
+
+        else:
+
+            fps = 0
+
+        prev_frame_time = (
+            current_time
+        )
+
+        if (
+
+            current_time
+            - last_inference_time
+
+            >= INFERENCE_INTERVAL
+
+        ):
+
+            last_inference_time = (
+                current_time
+            )
+
+            object_boxes.clear()
+            person_boxes.clear()
+
+            fire_boxes.clear()
+            smoke_boxes.clear()
+            ignored_boxes.clear()
+
             detected_labels.clear()
 
-            max_fire_area = 0
-            primary_fire_box = None
+            frame_height, frame_width = (
+                frame.shape[:2]
+            )
+
+            frame_area = (
+
+                frame_width
+
+                *
+
+                frame_height
+
+            )
+
+            max_hazard_area = 0
+
+            primary_hazard_box = None
+
             person_near = False
 
-            # Object Detection
-            obj_results = model_obj(frame, verbose=False)[0]
+            # =================================================
+            # GENERAL OBJECT DETECTION
+            # =================================================
+
+            obj_results = model_obj(
+                frame,
+                verbose=False
+            )[0]
 
             for box in obj_results.boxes:
 
-                cls = int(box.cls[0])
-                label = model_obj.names[cls]
+                cls = int(
+                    box.cls[0]
+                )
 
-                detected_labels.append(label)
+                label = (
+                    model_obj.names[cls]
+                )
 
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                detected_labels.append(
+                    label
+                )
 
+                x1, y1, x2, y2 = map(
+
+                    int,
+
+                    box.xyxy[0]
+
+                )
+
+                current_box = (
+                    x1,
+                    y1,
+                    x2,
+                    y2
+                )
+
+                # COCO class 0 = person
                 if cls == 0:
-                    c_p_boxes.append((x1, y1, x2, y2))
+
+                    person_boxes.append(
+                        current_box
+                    )
+
                 else:
-                    c_boxes.append((x1, y1, x2, y2))
 
-            # Fire Detection
-            fire_results = model_fire(frame, verbose=False, conf=0.65)[0]
+                    object_boxes.append(
+                        current_box
+                    )
 
-            valid_hazard_found_this_frame = False
+
+            # =================================================
+            # FIRE / SMOKE DETECTION
+            # =================================================
+
+            fire_results = model_fire(
+
+                frame,
+
+                verbose=False,
+
+                conf=FIRE_CONFIDENCE
+
+            )[0]
+
+            valid_hazard_found = False
 
             for box in fire_results.boxes:
 
-                label = model_fire.names[int(box.cls[0])].lower()
+                cls = int(
+                    box.cls[0]
+                )
 
-                coords = box.xyxy[0]
+                label = (
 
-                x1, y1, x2, y2 = map(int, coords)
+                    model_fire
+                    .names[cls]
+                    .lower()
 
-                if label in ["fire", "smoke", "flame"]:
+                )
 
-                    is_valid = False
+                coords = (
+                    box.xyxy[0]
+                )
 
-                    if label == "smoke":
+                x1, y1, x2, y2 = map(
 
-                        is_valid = True
-                        c_s_boxes.append((x1, y1, x2, y2))
+                    int,
 
-                    else:
+                    coords
 
-                        if is_physically_fire(frame, coords):
+                )
 
-                            is_valid = True
-                            c_f_boxes.append((x1, y1, x2, y2))
+                hazard_box = (
 
-                        else:
+                    x1,
+                    y1,
+                    x2,
+                    y2
 
-                            c_i_boxes.append((x1, y1, x2, y2))
+                )
 
-                    if is_valid:
+                if label not in [
 
-                        valid_hazard_found_this_frame = True
+                    "fire",
+                    "smoke",
+                    "flame"
 
-                        area = (x2 - x1) * (y2 - y1)
+                ]:
 
-                        if area > max_fire_area:
-                            max_fire_area = area
-                            primary_fire_box = (x1, y1, x2, y2)
+                    continue
 
-            # Temporal Hazard Verification
-            if valid_hazard_found_this_frame:
 
-                current_streak += 1
+                # Smoke is accepted from the trained model.
+                if label == "smoke":
 
-                if current_streak > REQUIRED_STREAK + 5:
-                    current_streak = REQUIRED_STREAK + 5
+                    is_valid = True
 
-            else:
-
-                current_streak = max(0, current_streak - 1)
-
-                if current_streak == 0:
-                    last_alert_level = 0
-
-            # Human Proximity Check
-            if primary_fire_box:
-
-                for p_box in c_p_boxes:
-
-                    if intersects(p_box, primary_fire_box):
-
-                        person_near = True
-
-            # Alert Logic
-            alert_text = "SYSTEM SAFE"
-            alert_color = (0, 255, 0)
-
-            if current_streak >= REQUIRED_STREAK:
-
-                if max_fire_area >= LARGE_THRESH:
-
-                    alert_text = "LEVEL 3: CRITICAL EMERGENCY"
-                    alert_color = (0, 0, 255)
-
-                    trigger_alert(
-                        "LEVEL 3: Large hazard detected. Evacuate immediately.",
-                        3
-                    )
-
-                elif person_near:
-
-                    alert_text = "LEVEL 1: Hazard Near Person"
-                    alert_color = (0, 255, 255)
-
-                    trigger_alert(
-                        "Level 1: Hazard detected near human presence.",
-                        1
+                    smoke_boxes.append(
+                        hazard_box
                     )
 
                 else:
 
-                    alert_text = "LEVEL 2: Unattended Hazard"
-                    alert_color = (0, 165, 255)
+                    is_valid = (
+                        is_physically_fire(
+                            frame,
+                            coords
+                        )
+                    )
+
+                    if is_valid:
+
+                        fire_boxes.append(
+                            hazard_box
+                        )
+
+                    else:
+
+                        ignored_boxes.append(
+                            hazard_box
+                        )
+
+
+                if is_valid:
+
+                    valid_hazard_found = True
+
+                    area = max(
+
+                        0,
+
+                        (
+                            x2 - x1
+                        )
+
+                        *
+
+                        (
+                            y2 - y1
+                        )
+
+                    )
+
+                    if (
+                        area
+                        > max_hazard_area
+                    ):
+
+                        max_hazard_area = (
+                            area
+                        )
+
+                        primary_hazard_box = (
+                            hazard_box
+                        )
+
+
+            # =================================================
+            # TEMPORAL VERIFICATION
+            # =================================================
+
+            if valid_hazard_found:
+
+                current_streak += 1
+
+                current_streak = min(
+
+                    current_streak,
+
+                    REQUIRED_STREAK + 5
+
+                )
+
+            else:
+
+                current_streak = max(
+
+                    0,
+
+                    current_streak - 1
+
+                )
+
+                if current_streak == 0:
+
+                    last_alert_level = 0
+
+                    fire_area_history.clear()
+
+
+            # =================================================
+            # NORMALIZED HAZARD AREA
+            # =================================================
+
+            hazard_area_ratio = (
+
+                max_hazard_area
+                / frame_area
+
+                if frame_area > 0
+
+                else 0
+
+            )
+
+            if valid_hazard_found:
+
+                fire_area_history.append(
+                    hazard_area_ratio
+                )
+
+
+            growth_rate = (
+                calculate_growth_rate()
+            )
+
+
+            # =================================================
+            # PERSON PROXIMITY ANALYSIS
+            # =================================================
+
+            if primary_hazard_box:
+
+                for person_box in person_boxes:
+
+                    if person_is_near_hazard(
+
+                        person_box,
+
+                        primary_hazard_box,
+
+                        frame_width,
+
+                        frame_height
+
+                    ):
+
+                        person_near = True
+
+                        break
+
+
+            # =================================================
+            # MULTI-LEVEL ALERT LOGIC
+            # =================================================
+
+            alert_text = (
+                "SYSTEM SAFE"
+            )
+
+            alert_color = (
+                0,
+                255,
+                0
+            )
+
+
+            if (
+
+                current_streak
+
+                >= REQUIRED_STREAK
+
+            ):
+
+                rapid_growth = (
+
+                    growth_rate
+
+                    >= RAPID_GROWTH_THRESHOLD
+
+                )
+
+                large_hazard = (
+
+                    hazard_area_ratio
+
+                    >= LARGE_HAZARD_RATIO
+
+                )
+
+
+                # LEVEL 3
+                #
+                # Rapidly expanding hazard
+                # OR visually large hazard.
+                #
+                # Uses TEST emergency contact only.
+                if (
+
+                    rapid_growth
+
+                    or large_hazard
+
+                ):
+
+                    alert_text = (
+
+                        "LEVEL 3: "
+                        "CRITICAL EMERGENCY"
+
+                    )
+
+                    alert_color = (
+                        0,
+                        0,
+                        255
+                    )
 
                     trigger_alert(
-                        "Level 2: Unattended hazard detected.",
-                        2
+
+                        (
+                            "Critical hazard detected. "
+                            "Rapid fire growth or large "
+                            "hazard area observed. "
+                            "Immediate action required."
+                        ),
+
+                        3
+
                     )
+
+
+                # LEVEL 1
+                #
+                # Small/localized hazard
+                # with a nearby person.
+                elif person_near:
+
+                    alert_text = (
+
+                        "LEVEL 1: "
+                        "LOCAL HAZARD"
+
+                    )
+
+                    alert_color = (
+                        0,
+                        255,
+                        255
+                    )
+
+                    trigger_alert(
+
+                        (
+                            "Localized hazard detected "
+                            "with human presence nearby."
+                        ),
+
+                        1
+
+                    )
+
+
+                # LEVEL 2
+                #
+                # Verified hazard with no nearby person.
+                else:
+
+                    alert_text = (
+
+                        "LEVEL 2: "
+                        "UNATTENDED HAZARD"
+
+                    )
+
+                    alert_color = (
+                        0,
+                        165,
+                        255
+                    )
+
+                    trigger_alert(
+
+                        (
+                            "Verified unattended hazard "
+                            "detected. Property owner "
+                            "notification required."
+                        ),
+
+                        2
+
+                    )
+
 
             elif current_streak > 0:
 
-                alert_text = f"VERIFYING HAZARD ({current_streak}/{REQUIRED_STREAK})"
-                alert_color = (0, 100, 255)
+                alert_text = (
 
-        # Draw Bounding Boxes
-        for x1, y1, x2, y2 in c_boxes:
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 1)
+                    "VERIFYING HAZARD "
 
-        for x1, y1, x2, y2 in c_p_boxes:
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-            cv2.putText(frame, "Person", (x1, y1 - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+                    f"({current_streak}/"
+                    f"{REQUIRED_STREAK})"
 
-        for x1, y1, x2, y2 in c_f_boxes:
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
-            cv2.putText(frame, "CONFIRMED FIRE", (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                )
 
-        for x1, y1, x2, y2 in c_s_boxes:
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (150, 150, 150), 3)
-            cv2.putText(frame, "SMOKE DETECTED", (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (150, 150, 150), 2)
+                alert_color = (
+                    0,
+                    100,
+                    255
+                )
 
-        for x1, y1, x2, y2 in c_i_boxes:
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (100, 100, 100), 2)
-            cv2.putText(frame, "IGNORED", (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 2)
 
-        # Diagnostics Panel
-        h, w = frame.shape[:2]
+        # =====================================================
+        # DRAW DETECTIONS
+        # =====================================================
 
-        panel = np.zeros((h, 220, 3), dtype=np.uint8)
+        for (
+            x1,
+            y1,
+            x2,
+            y2
+        ) in object_boxes:
 
-        cv2.putText(panel, "DIAGNOSTICS", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
+            cv2.rectangle(
 
-        fps_color = (0, 255, 0) if fps > 10 else (0, 165, 255)
+                frame,
 
-        cv2.putText(panel, f"Live FPS: {int(fps)}",
-                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, fps_color, 2)
+                (x1, y1),
 
-        cv2.putText(panel, f"AI Limit: {int(FPS_TARGET)} FPS",
-                    (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                (x2, y2),
 
-        cv2.putText(panel, "OBJECT LIST",
-                    (10, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
+                (0, 255, 0),
 
-        unique_labels = sorted(list(set(detected_labels)))
+                1
 
-        for i, label in enumerate(unique_labels[:12]):
-            cv2.putText(panel, f"- {label}",
-                        (10, 160 + (i * 25)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            )
 
-        # Alert Banner
-        cv2.rectangle(frame, (0, 0), (w, 50), alert_color, -1)
 
-        cv2.putText(frame, alert_text,
-                    (20, 35),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1.2,
-                    (255, 255, 255),
-                    2)
+        for (
+            x1,
+            y1,
+            x2,
+            y2
+        ) in person_boxes:
 
-        combined = np.hstack((frame, panel))
+            cv2.rectangle(
 
-        cv2.imshow("YOLO Early FIRE/SMOKE detection and Alert System", combined)
+                frame,
 
-        if cv2.waitKey(1) & 0xFF == ord("q"):
+                (x1, y1),
+
+                (x2, y2),
+
+                (255, 0, 0),
+
+                2
+
+            )
+
+            cv2.putText(
+
+                frame,
+
+                "Person",
+
+                (
+                    x1,
+                    max(20, y1 - 5)
+                ),
+
+                cv2.FONT_HERSHEY_SIMPLEX,
+
+                0.5,
+
+                (255, 0, 0),
+
+                1
+
+            )
+
+
+        for (
+            x1,
+            y1,
+            x2,
+            y2
+        ) in fire_boxes:
+
+            cv2.rectangle(
+
+                frame,
+
+                (x1, y1),
+
+                (x2, y2),
+
+                (0, 0, 255),
+
+                3
+
+            )
+
+            cv2.putText(
+
+                frame,
+
+                "CONFIRMED FIRE",
+
+                (
+                    x1,
+                    max(20, y1 - 10)
+                ),
+
+                cv2.FONT_HERSHEY_SIMPLEX,
+
+                0.7,
+
+                (0, 0, 255),
+
+                2
+
+            )
+
+
+        for (
+            x1,
+            y1,
+            x2,
+            y2
+        ) in smoke_boxes:
+
+            cv2.rectangle(
+
+                frame,
+
+                (x1, y1),
+
+                (x2, y2),
+
+                (150, 150, 150),
+
+                3
+
+            )
+
+            cv2.putText(
+
+                frame,
+
+                "SMOKE DETECTED",
+
+                (
+                    x1,
+                    max(20, y1 - 10)
+                ),
+
+                cv2.FONT_HERSHEY_SIMPLEX,
+
+                0.7,
+
+                (150, 150, 150),
+
+                2
+
+            )
+
+
+        for (
+            x1,
+            y1,
+            x2,
+            y2
+        ) in ignored_boxes:
+
+            cv2.rectangle(
+
+                frame,
+
+                (x1, y1),
+
+                (x2, y2),
+
+                (100, 100, 100),
+
+                2
+
+            )
+
+            cv2.putText(
+
+                frame,
+
+                "IGNORED",
+
+                (
+                    x1,
+                    max(20, y1 - 10)
+                ),
+
+                cv2.FONT_HERSHEY_SIMPLEX,
+
+                0.5,
+
+                (100, 100, 100),
+
+                2
+
+            )
+
+
+        # =====================================================
+        # DIAGNOSTICS PANEL
+        # =====================================================
+
+        height, width = (
+            frame.shape[:2]
+        )
+
+        panel = np.zeros(
+
+            (
+                height,
+                250,
+                3
+            ),
+
+            dtype=np.uint8
+
+        )
+
+
+        cv2.putText(
+
+            panel,
+
+            "DIAGNOSTICS",
+
+            (10, 30),
+
+            cv2.FONT_HERSHEY_SIMPLEX,
+
+            0.8,
+
+            (200, 200, 200),
+
+            2
+
+        )
+
+
+        cv2.putText(
+
+            panel,
+
+            f"Live FPS: {int(fps)}",
+
+            (10, 65),
+
+            cv2.FONT_HERSHEY_SIMPLEX,
+
+            0.6,
+
+            (255, 255, 255),
+
+            1
+
+        )
+
+
+        cv2.putText(
+
+            panel,
+
+            (
+                "Hazard Area: "
+                f"{hazard_area_ratio:.3f}"
+            ),
+
+            (10, 95),
+
+            cv2.FONT_HERSHEY_SIMPLEX,
+
+            0.6,
+
+            (255, 255, 255),
+
+            1
+
+        )
+
+
+        cv2.putText(
+
+            panel,
+
+            (
+                "Growth: "
+                f"{growth_rate:.3f}"
+            ),
+
+            (10, 125),
+
+            cv2.FONT_HERSHEY_SIMPLEX,
+
+            0.6,
+
+            (255, 255, 255),
+
+            1
+
+        )
+
+
+        cv2.putText(
+
+            panel,
+
+            (
+                "Person Near: "
+                f"{person_near}"
+            ),
+
+            (10, 155),
+
+            cv2.FONT_HERSHEY_SIMPLEX,
+
+            0.6,
+
+            (255, 255, 255),
+
+            1
+
+        )
+
+
+        cv2.putText(
+
+            panel,
+
+            "OBJECT LIST",
+
+            (10, 195),
+
+            cv2.FONT_HERSHEY_SIMPLEX,
+
+            0.7,
+
+            (200, 200, 200),
+
+            2
+
+        )
+
+
+        unique_labels = sorted(
+
+            set(
+                detected_labels
+            )
+
+        )
+
+
+        for i, label in enumerate(
+
+            unique_labels[:10]
+
+        ):
+
+            cv2.putText(
+
+                panel,
+
+                f"- {label}",
+
+                (
+                    10,
+                    225 + i * 22
+                ),
+
+                cv2.FONT_HERSHEY_SIMPLEX,
+
+                0.5,
+
+                (255, 255, 255),
+
+                1
+
+            )
+
+
+        # =====================================================
+        # ALERT BANNER
+        # =====================================================
+
+        cv2.rectangle(
+
+            frame,
+
+            (0, 0),
+
+            (width, 50),
+
+            alert_color,
+
+            -1
+
+        )
+
+
+        cv2.putText(
+
+            frame,
+
+            alert_text,
+
+            (20, 35),
+
+            cv2.FONT_HERSHEY_SIMPLEX,
+
+            0.9,
+
+            (255, 255, 255),
+
+            2
+
+        )
+
+
+        combined = np.hstack(
+
+            (
+                frame,
+                panel
+            )
+
+        )
+
+
+        cv2.imshow(
+
+            (
+                "YOLO Fire/Smoke Detection "
+                "and Alert System"
+            ),
+
+            combined
+
+        )
+
+
+        if (
+
+            cv2.waitKey(1)
+
+            & 0xFF
+
+            == ord("q")
+
+        ):
+
             break
 
+
     cap.release()
+
     cv2.destroyAllWindows()
 
-# Run Program
+
+# ============================================================
+# RUN PROGRAM
+# ============================================================
+
 if __name__ == "__main__":
+
     main()
